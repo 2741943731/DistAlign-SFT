@@ -1,0 +1,5 @@
+{"id":"decimal","completion":"A half is \\boxed{0.5}.","answer":"1/2"}
+{"id":"nested-fraction","completion":"Therefore the answer is \\boxed{\\frac{1}{2}}.","answer":"0.5"}
+{"id":"wrong-final","completion":"First try \\boxed{3}. My final answer is \\boxed{4}.","answer":"3"}
+{"id":"missing-box","completion":"I reached the value 3 but did not format the answer.","answer":"3"}
+{"id":"symbolic","completion":"Thus \\boxed{\\sqrt{8}}.","answer":"2\\sqrt{2}"}
