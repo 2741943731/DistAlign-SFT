@@ -2,7 +2,7 @@
 
 研究小模型的数学推理后训练：在同一份教师 CoT 上比较 SFT、DFT、IDFT，再通过 Hinted Decoding 调整数据分布，检查数据与损失的交互如何影响泛化。[原始项目方案与参考文献](docs/DistAlign-SFT_项目方案与参考文献.md)保留了完整实验设计。
 
-当前是 Phase 0 起点：已包含本地 JSONL 清洗、SFT / DFT 损失，以及一条用小型随机初始化模型运行的 CPU 冒烟流程。尚未使用 Qwen 或真实训练数据跑实验。[实验登记表](experiments/ablations.md)记录计划中的 A–E 组。
+当前是 Phase 0：已包含 JSONL 清洗、SFT / DFT 损失、生成与判分，以及使用本地 Qwen 权重的单卡 LoRA 试跑入口。[实验登记表](experiments/ablations.md)记录计划中的 A–E 组；试跑用于验证流程，正式对照尚未完成。
 
 ## 本地验证
 
@@ -42,6 +42,31 @@ cat "$BASE_DEMO/base/graded.jsonl"
 ```
 
 生成器固定 Base 模型版本，只把题目放进提示，只解码新增的 Token。`predictions.jsonl` 保存生成结果，`run.json` 记录模型版本、输入哈希和生成设置。三道题的分数只用于检查流程。
+
+## 服务器上的 LoRA 试跑
+
+使用已经能运行生成脚本的 PyTorch / Transformers 5 环境。训练与加载 LoRA 还需要 [PEFT](https://huggingface.co/docs/peft/en/quicktour)。先检查 `python -c 'import peft; print(peft.__version__)'`；如果缺少 PEFT，可用 `python -m pip install --dry-run 'peft==0.21.3'` 检查安装计划，确认不会替换当前 PyTorch 和 Transformers 后再去掉 `--dry-run` 安装。
+
+先用 8 道训练题做一次保存和重载检查。把下方路径替换为服务器上的实际路径，运行前进入项目目录并选择已分配的 GPU：
+
+```bash
+MODEL=/path/to/Qwen2.5-Math-1.5B
+TRAIN_DATA=data/processed/train.jsonl
+QUESTIONS=data/processed/lesson4/numeric-validation.jsonl
+mkdir -p runs
+PILOT=$(mktemp -d "$PWD/runs/lora-pilot.XXXXXX")
+
+python -B -m src.hf_train \
+  --model "$MODEL" --train-data "$TRAIN_DATA" --output-dir "$PILOT/sft" \
+  --loss-type sft --device cuda --limit 8 --epochs 1 --batch-size 1 --max-length 1024 &&
+python -B -m src.generate \
+  --model "$MODEL" --adapter "$PILOT/sft/adapter" --local-files-only --device cuda \
+  --questions "$QUESTIONS" --output-dir "$PILOT/eval" --limit 15 --max-new-tokens 1024 &&
+python -B -m src.grade --predictions "$PILOT/eval/predictions.jsonl" \
+  --output "$PILOT/eval/graded.jsonl"
+```
+
+训练只更新 `q_proj` 和 `v_proj` 上的 LoRA 参数，并使用与生成一致的题目模板。题目和补齐部分不计入损失；超过 `--max-length` 的完整解答会跳过，数量写入训练的 `run.json`。`sft/steps.jsonl` 记录每步损失和梯度，`sft/adapter/` 保存小型 adapter。重载后用同一批开发题、同一判分规则和 1024 个新 Token 预算，便于和 Base 试跑对照。确认流程正常后，再用同一份训练数据和设置，把 `--loss-type` 改为 `dft` 并使用新的输出目录。
 
 ## 接入真实实验
 

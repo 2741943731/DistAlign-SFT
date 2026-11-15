@@ -1,4 +1,4 @@
-"""Generate saved completions for a small, untuned Base model trial."""
+"""Generate saved completions from a Base model or a local LoRA adapter."""
 
 import argparse
 import json
@@ -54,6 +54,7 @@ def main() -> None:
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--model", default=QWEN_BASE, help="A Hub model ID or a local checkpoint directory")
     parser.add_argument("--revision", help="Full commit SHA for a Hub model; Qwen Base has a fixed default")
+    parser.add_argument("--adapter", type=Path, help="Local LoRA adapter to load on top of --model")
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
@@ -61,6 +62,10 @@ def main() -> None:
         parser.error("--limit and --max-new-tokens must be positive")
     if args.output_dir.exists() or args.output_dir.is_symlink():
         parser.error(f"output directory already exists: {args.output_dir}")
+    if args.adapter is not None:
+        adapter_files = ("adapter_config.json", "adapter_model.safetensors")
+        if not all((args.adapter / filename).is_file() for filename in adapter_files):
+            parser.error(f"expected adapter_config.json and adapter_model.safetensors in {args.adapter}")
     local_model = Path(args.model).is_dir()
     if local_model and args.revision:
         parser.error("--revision applies only to Hub models")
@@ -79,6 +84,11 @@ def main() -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         parser.error(f"generation requires PyTorch and Transformers: {exc}")
+    if args.adapter is not None:
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            parser.error(f"--adapter requires compatible PEFT: {exc}")
 
     available = {"cuda": torch.cuda.is_available(), "mps": torch.backends.mps.is_available(), "cpu": True}
     device = args.device if args.device != "auto" else next(name for name, ok in available.items() if ok)
@@ -89,7 +99,10 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name, **load_options)
     model = AutoModelForCausalLM.from_pretrained(
         model_name, dtype=torch.float16 if device == "mps" else "auto", use_safetensors=True, **load_options,
-    ).to(device).eval()
+    ).to(device)
+    if args.adapter is not None:
+        model = PeftModel.from_pretrained(model, args.adapter.resolve(), is_trainable=False, local_files_only=True)
+    model.eval()
 
     def generate_one(prompt):
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -106,6 +119,7 @@ def main() -> None:
     rows = list(generate_rows(questions[:args.limit], generate_one))
     run = {
         "model": model_name, "revision": revision, "device": device, "dtype": str(next(model.parameters()).dtype),
+        "adapter": str(args.adapter.resolve()) if args.adapter is not None else None,
         "torch": torch.__version__, "transformers": transformers.__version__, "questions": source,
         "limit": args.limit, "generated_rows": len(rows), "prompt_template": PROMPT,
         "max_new_tokens": args.max_new_tokens, "do_sample": False, "num_beams": 1, "trim_at": NEXT_QUESTION,
