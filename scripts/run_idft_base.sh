@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd -- "$(dirname -- "$0")/.."
 DISTALIGN_ROOT=$PWD
-DISTALIGN_VLLM_PY=${DISTALIGN_VLLM_PY:-/mnt/d/lfy/anaconda3/envs/nanovllm/bin/python}
+DISTALIGN_VLLM_PY=${DISTALIGN_VLLM_PY:-/mnt/d/lfy/ustc/shopping-grpo-longhorizon/.venv/bin/python}
 DISTALIGN_SCORE_PY=${DISTALIGN_SCORE_PY:-$DISTALIGN_ROOT/.score-venv/bin/python}
 DISTALIGN_MODEL=${DISTALIGN_MODEL:-/mnt/d/lfy/ustc/models/Qwen2.5-Math-1.5B}
 DISTALIGN_MODE=${1:-check}
@@ -34,11 +34,18 @@ if [[ "$DISTALIGN_MODE" == check ]]; then
   exit
 fi
 
+DISTALIGN_SMOKE_QUESTIONS="$DISTALIGN_ROOT/examples/evaluation.jsonl"
+DISTALIGN_SMOKE_OUTPUT="$DISTALIGN_ROOT/results/smoke"
+distalign_check_smoke() {
+  "$DISTALIGN_SCORE_PY" -B -m src.paper_eval check-smoke --suite smoke \
+    --questions "$DISTALIGN_SMOKE_QUESTIONS" --output-dir "$DISTALIGN_SMOKE_OUTPUT"
+}
+
 if [[ "$DISTALIGN_MODE" == smoke ]]; then
-  DISTALIGN_QUESTIONS="$DISTALIGN_ROOT/examples/evaluation.jsonl"
+  DISTALIGN_QUESTIONS="$DISTALIGN_SMOKE_QUESTIONS"
 else
-  test -s "$DISTALIGN_ROOT/results/smoke/metrics.json" || {
-    printf '请先运行 smoke，用手写题检查完整流程。\n' >&2
+  distalign_check_smoke || {
+    printf '手写题试跑未通过，MATH-500 未启动。\n' >&2
     exit 1
   }
   DISTALIGN_QUESTIONS="$DISTALIGN_ROOT/data/processed/final/math500-questions.jsonl"
@@ -51,3 +58,6 @@ if [[ ! -s "$DISTALIGN_OUTPUT/metrics.json" ]]; then
 fi
 cat "$DISTALIGN_OUTPUT/metrics.json"
 printf '结果目录：%s\n' "$DISTALIGN_OUTPUT"
+if [[ "$DISTALIGN_MODE" == smoke ]]; then
+  distalign_check_smoke
+fi

@@ -1,0 +1,19 @@
+{
+  "questions": 500,
+  "rounds": 16,
+  "attempts": 8000,
+  "mean_accuracy": 0.488625,
+  "round_accuracy": [
+    0.482, 0.45, 0.504, 0.484, 0.47, 0.504, 0.508, 0.488,
+    0.488, 0.492, 0.486, 0.504, 0.492, 0.462, 0.492, 0.512
+  ],
+  "counts": {
+    "correct": 3909,
+    "incorrect": 2415,
+    "unparsed": 1105,
+    "unsupported": 571
+  },
+  "at_generation_limit": 280,
+  "metric": "mean single-attempt accuracy",
+  "scorer": "math-verify-0.9.0-whole-box-v1"
+}
