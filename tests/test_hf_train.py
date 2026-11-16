@@ -1,4 +1,5 @@
 import importlib.util
+from types import SimpleNamespace
 import unittest
 
 from src.generate import PROMPT
@@ -6,7 +7,10 @@ from src.generate import PROMPT
 if importlib.util.find_spec("torch") is not None:
     import torch
 
-    from src.hf_train import collate_examples, encode_example
+    from src.hf_train import (
+        backward_token_mean, collate_examples, encode_example, learning_rate_at_step, optimizer_batches,
+    )
+    from src.losses import LOSS_TYPES, causal_lm_loss
 else:
     torch = None
 
@@ -51,3 +55,56 @@ class HFTrainTests(unittest.TestCase):
         self.assertEqual(batch["attention_mask"].tolist(), [[1, 1, 1, 0], [1, 1, 1, 1]])
         self.assertEqual(batch["labels"].tolist(), [[-100, 40, eos, -100], [-100, 50, 60, eos]])
         self.assertEqual(batch["labels"].dtype, torch.long)
+
+    def test_optimizer_batches_keep_shuffle_order_and_remainder(self):
+        examples = list("abcdefg")
+        order = [6, 2, 3, 0, 5, 1, 4]
+        self.assertEqual(
+            list(optimizer_batches(examples, order, batch_size=2, accumulation_steps=2)),
+            [[["g", "c"], ["d", "a"]], [["f", "b"], ["e"]]],
+        )
+
+    def test_uneven_microbatches_match_one_token_mean_backward(self):
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = torch.nn.Sequential(torch.nn.Embedding(8, 3), torch.nn.Linear(3, 8)).double()
+
+            def forward(self, input_ids, attention_mask, use_cache):
+                return SimpleNamespace(logits=self.net(input_ids))
+
+        examples = [
+            ([1, 2], [-100, 2]),
+            ([1, 3, 2], [-100, -100, 2]),
+            ([1, 4, 5, 6, 2], [-100, 4, 5, 6, 2]),
+        ]
+        (micro_batches,) = optimizer_batches(examples, [0, 1, 2], batch_size=2, accumulation_steps=2)
+        model = TinyModel()
+        for loss_type in LOSS_TYPES:
+            with self.subTest(loss_type=loss_type):
+                model.zero_grad()
+                batch = collate_examples(examples, pad_token_id=0)
+                labels = batch.pop("labels")
+                together = causal_lm_loss(model(**batch, use_cache=False).logits, labels, loss_type=loss_type)
+                together.backward()
+                gradients = [p.grad.clone() for p in model.parameters()]
+
+                model.zero_grad()
+                stats = backward_token_mean(model, micro_batches, 0, "cpu", loss_type, step=1)
+                for p, expected_gradient in zip(model.parameters(), gradients):
+                    torch.testing.assert_close(p.grad, expected_gradient)
+                self.assertAlmostEqual(stats["loss"], together.item())
+                self.assertEqual(stats["supervised_tokens"], 6)
+                self.assertEqual(stats["effective_batch_size"], 3)
+                self.assertEqual(stats["micro_batches"], 2)
+                self.assertEqual(stats["max_sequence_width"], 5)
+
+    def test_learning_rate_uses_optimizer_steps(self):
+        self.assertEqual([learning_rate_at_step(1, s, 3, 0, "constant") for s in range(3)], [1, 1, 1])
+        self.assertEqual(learning_rate_at_step(1, 0, 1, 0, "cosine"), 1)
+        rates = [learning_rate_at_step(1, s, 6, 2, "cosine") for s in range(6)]
+        self.assertEqual(rates[:3], [0.5, 1, 1])
+        self.assertAlmostEqual(rates[4], 0.5)
+        self.assertGreater(rates[5], 0)
+        self.assertGreater(rates[3], rates[4])
+        self.assertGreater(rates[4], rates[5])

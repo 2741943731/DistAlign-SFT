@@ -39,6 +39,69 @@ def collate_examples(examples, pad_token_id):
     }
 
 
+def optimizer_batches(examples, order, batch_size, accumulation_steps):
+    """Yield one optimizer batch at a time, split into nonempty microbatches."""
+    effective_size = batch_size * accumulation_steps
+    for offset in range(0, len(order), effective_size):
+        indices = order[offset:offset + effective_size]
+        yield [
+            [examples[index] for index in indices[start:start + batch_size]]
+            for start in range(0, len(indices), batch_size)
+        ]
+
+
+def learning_rate_at_step(base_rate, step, total_steps, warmup_steps, schedule):
+    """Return the rate used for a zero-indexed optimizer update.
+
+    Warmup reaches the base rate on its last update. Cosine decay starts at
+    the base rate and reaches zero after the last update.
+    """
+    if step < warmup_steps:
+        return base_rate * ((step + 1) / warmup_steps)
+    if schedule == "cosine":
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        return base_rate * 0.5 * (1 + math.cos(math.pi * progress))
+    return base_rate
+
+
+def backward_token_mean(model, micro_batches, pad_token_id, device, loss_type, step):
+    """Accumulate the gradient of the token mean of the whole optimizer batch."""
+    token_counts = [
+        sum(label != IGNORE_INDEX for _, labels in chunk for label in labels[1:])
+        for chunk in micro_batches
+    ]
+    if not token_counts or min(token_counts) < 1:
+        raise RuntimeError(f"no supervised tokens in a microbatch at step {step}")
+    total_tokens = sum(token_counts)
+    total_loss = 0.0
+    max_width = 0
+    for chunk, tokens in zip(micro_batches, token_counts):
+        batch = collate_examples(chunk, pad_token_id)
+        labels = batch.pop("labels")
+        max_width = max(max_width, labels.shape[1])
+        inputs = {key: value.to(device) for key, value in batch.items()}
+        logits = model(**inputs, use_cache=False).logits
+        loss = causal_lm_loss(logits, labels.to(device), loss_type=loss_type)
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
+            raise RuntimeError(f"nonfinite loss at step {step}")
+        # Each microbatch loss is already a mean; weight it by its supervised
+        # token count, including when the last optimizer batch is incomplete.
+        if len(micro_batches) == 1:
+            loss.backward()
+        else:
+            (loss * (tokens / total_tokens)).backward()
+        total_loss += loss_value * tokens
+        del logits, loss
+    return {
+        "loss": total_loss / total_tokens,
+        "supervised_tokens": total_tokens,
+        "micro_batches": len(micro_batches),
+        "effective_batch_size": sum(map(len, micro_batches)),
+        "max_sequence_width": max_width,
+    }
+
+
 def read_training_data(path, tokenizer, max_length, limit):
     reader = Jsonl(path)
     examples = []
@@ -66,18 +129,31 @@ def main() -> None:
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--limit", type=int, help="Select the first N examples that fit")
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1, help="Examples per microbatch")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Microbatches per optimizer update")
     parser.add_argument("--max-length", type=int, default=1024, help="Prompt and solution combined, including EOS")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
+    parser.add_argument("--warmup-ratio", type=float, default=0.0, help="Fraction of optimizer updates for linear warmup, rounded down")
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     if min(args.epochs, args.batch_size) < 1 or args.max_length < 2:
         parser.error("--epochs and --batch-size must be positive, --max-length must be at least 2")
+    if args.gradient_accumulation_steps < 1:
+        parser.error("--gradient-accumulation-steps must be positive")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         parser.error("--learning-rate must be positive and finite")
+    if not 0 <= args.warmup_ratio < 1:
+        parser.error("--warmup-ratio must be in [0, 1)")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("--weight-decay must be nonnegative and finite")
+    if not 0 <= args.adam_beta2 < 1:
+        parser.error("--adam-beta2 must be in [0, 1)")
     if not args.model.is_dir():
         parser.error(f"local model directory does not exist: {args.model}")
     if args.output_dir.exists() or args.output_dir.is_symlink():
@@ -123,37 +199,40 @@ def main() -> None:
     if not trainable:
         raise RuntimeError("LoRA did not expose any trainable parameters")
     initial = [p.detach().clone() for p in trainable]
-    optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=0.0)
+    adam_betas = (0.9, args.adam_beta2)
+    optimizer = torch.optim.AdamW(
+        trainable, lr=args.learning_rate, betas=adam_betas, weight_decay=args.weight_decay,
+    )
     generator = torch.Generator().manual_seed(args.seed)
 
-    step = supervised_tokens = 0
+    nominal_batch_size = args.batch_size * args.gradient_accumulation_steps
+    updates_per_epoch = (len(examples) + nominal_batch_size - 1) // nominal_batch_size
+    total_steps = updates_per_epoch * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    step = supervised_tokens = micro_batch_count = max_width = max_batch_size = 0
+    min_batch_size = nominal_batch_size
     args.output_dir.mkdir(parents=True)
     print(json.dumps({"loss_type": args.loss_type, "train_data": train_data}), flush=True)
     start = time.perf_counter()
     with (args.output_dir / "steps.jsonl").open("x", encoding="utf-8") as log:
         for epoch in range(1, args.epochs + 1):
             order = torch.randperm(len(examples), generator=generator).tolist()
-            for offset in range(0, len(order), args.batch_size):
-                chunk = [examples[i] for i in order[offset:offset + args.batch_size]]
-                batch = collate_examples(chunk, pad_token_id)
-                labels = batch.pop("labels")
-                tokens = labels[:, 1:].ne(IGNORE_INDEX).sum().item()
-                inputs = {key: value.to(device) for key, value in batch.items()}
+            for group in optimizer_batches(examples, order, args.batch_size, args.gradient_accumulation_steps):
+                lr = learning_rate_at_step(args.learning_rate, step, total_steps, warmup_steps, args.lr_schedule)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
                 optimizer.zero_grad(set_to_none=True)
-                logits = model(**inputs, use_cache=False).logits
-                loss = causal_lm_loss(logits, labels.to(device), loss_type=args.loss_type)
-                loss_value = loss.item()
-                if not math.isfinite(loss_value):
-                    raise RuntimeError(f"nonfinite loss at step {step + 1}")
-                loss.backward()
+                stats = backward_token_mean(model, group, pad_token_id, device, args.loss_type, step + 1)
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable, 1.0, error_if_nonfinite=True).item()
                 optimizer.step()
-                del logits, loss
                 step += 1
-                supervised_tokens += tokens
+                supervised_tokens += stats["supervised_tokens"]
+                micro_batch_count += stats["micro_batches"]
+                max_width = max(max_width, stats["max_sequence_width"])
+                min_batch_size = min(min_batch_size, stats["effective_batch_size"])
+                max_batch_size = max(max_batch_size, stats["effective_batch_size"])
                 record = json.dumps({
-                    "step": step, "epoch": epoch, "loss": loss_value,
-                    "supervised_tokens": tokens, "grad_norm": grad_norm,
+                    "step": step, "epoch": epoch, **stats, "grad_norm": grad_norm, "learning_rate": lr,
                 })
                 log.write(record + "\n")
                 print(record, flush=True)
@@ -169,10 +248,18 @@ def main() -> None:
         "transformers": transformers.__version__, "peft": peft.__version__,
         "seed": args.seed, "max_length": args.max_length, "limit": args.limit, "epochs": args.epochs,
         "batch_size": args.batch_size, "learning_rate": args.learning_rate, "prompt_template": PROMPT,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "nominal_effective_batch_size": nominal_batch_size,
+        "min_effective_batch_size": min_batch_size, "max_effective_batch_size": max_batch_size,
+        "lr_schedule": args.lr_schedule, "warmup_ratio": args.warmup_ratio, "warmup_steps": warmup_steps,
+        "optimizer": "AdamW", "adam_betas": adam_betas, "weight_decay": args.weight_decay,
         "lora": {"rank": LORA_RANK, "alpha": LORA_ALPHA, "target_modules": LORA_TARGETS},
         "trainable_parameters": sum(p.numel() for p in trainable), "parameters_updated": True,
-        "steps": step, "supervised_tokens": supervised_tokens, "training_time_seconds": elapsed,
+        "steps": step, "optimizer_steps": step, "micro_batches": micro_batch_count,
+        "max_observed_sequence_width": max_width,
+        "supervised_tokens": supervised_tokens, "training_time_seconds": elapsed,
         "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
+        "peak_cuda_memory_reserved_bytes": torch.cuda.max_memory_reserved() if device.type == "cuda" else None,
     }
     if args.loss_type == "idft":
         run["idft"] = {**IDFT_CONFIG, "warmup_ratio": 0.0, "transition_ratio": 0.0}
