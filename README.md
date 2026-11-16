@@ -2,7 +2,7 @@
 
 研究小模型的数学推理后训练：在同一份教师 CoT 上比较 SFT、DFT、IDFT，再通过 Hinted Decoding 调整数据分布，检查数据与损失的交互如何影响泛化。[原始项目方案与参考文献](docs/DistAlign-SFT_项目方案与参考文献.md)保留了完整实验设计。
 
-当前是 Phase 0：已包含 JSONL 清洗、SFT / DFT 损失、生成与判分，以及使用本地 Qwen 权重的单卡 LoRA 试跑入口。[实验登记表](experiments/ablations.md)记录计划中的 A–E 组；试跑用于验证流程，正式对照尚未完成。
+目前已包含 JSONL 清洗、SFT / DFT / IDFT 损失、生成与判分，以及使用本地 Qwen 权重的单卡 LoRA 试跑入口。[实验登记表](experiments/ablations.md)记录 A–E 组的进度；试跑用于验证流程，正式对照尚未完成。
 
 ## 本地验证
 
@@ -14,10 +14,11 @@ uv run python -m data.prepare --input examples/teacher.jsonl \
   --held-out examples/heldout.jsonl --output-dir data/processed/demo
 uv run python -m src.train --config configs/sft.toml --train-data data/processed/demo/train.jsonl
 uv run python -m src.train --config configs/dft.toml --train-data data/processed/demo/train.jsonl
+uv run python -m src.train --config configs/idft.toml --train-data data/processed/demo/train.jsonl
 uv run python -m unittest discover -s tests -v
 ```
 
-数据脚本产出 `train.jsonl`、`validation.jsonl` 和 `audit.json`；训练脚本输出每步的损失、参与监督的 Token 数与梯度范数。示例用于验证数据、掩码和反向传播，不能用来比较实际模型准确率；SFT 和 DFT 的损失数值尺度也不相同。
+数据脚本产出 `train.jsonl`、`validation.jsonl` 和 `audit.json`；训练脚本输出每步的损失、参与监督的 Token 数与梯度范数。示例用于验证数据、掩码和反向传播。三种损失的权重不同，损失数值不能直接用来比较模型效果。
 
 用手写答案练习逐题判分：
 
@@ -27,7 +28,17 @@ uv run python -m src.grade --predictions examples/grading.jsonl --output "$GRADE
 cat "$GRADE_DEMO/graded.jsonl"
 ```
 
-判分脚本读取每题的 `id`、纯生成文本 `completion` 与标准 `answer`，保存逐题提取和判分结果。当前原型只比较最后一个 `\boxed{...}` 中的整数、小数和简单分数；无法提取或不支持的答案单独计数，也留在准确率分母中。正式评测前应使用支持符号答案的评分规则，在独立验证数据上验证并冻结规则。
+判分脚本读取每题的 `id`、纯生成文本 `completion` 与标准 `answer`，保存逐题提取和判分结果。默认规则比较最后一个 `\boxed{...}` 中的整数、小数和简单分数；无法提取或不支持的答案单独计数，也留在准确率分母中。
+
+用手写例子检查符号判分。`--scorer symbolic` 仍提取最后一个答案框，用精确算术比较根式、含 π 的实数表达式、LaTeX 分式和独立的百分数。例如 `\sqrt{8}` 和 `2\sqrt{2}` 判为等价。额外依赖是固定版本的 Lark 和 SymPy；评分汇总标记为 `symbolic-v1`。
+
+```bash
+SYMBOLIC_DEMO=$(mktemp -d)
+uv run --extra symbolic-eval python -m src.grade --scorer symbolic \
+  --predictions examples/grading-symbolic.jsonl --output "$SYMBOLIC_DEMO/graded.jsonl"
+```
+
+该试验规则只支持有界的实数表达式。方程、集合、带单位的答案和残缺式仍记为 `unsupported`；未提取到完整答案框的仍记为 `unparsed`。旧命令继续使用原来的数值规则。正式评测前，先在独立开发题上核对答案类型的覆盖率和判分准确性，再固定评分规则。
 
 用 Qwen Base 对三道手写题做一次生成与判分试跑。生成需要 Transformers 5；首次加载会下载约 3.1 GB 的模型文件。`--device auto` 优先使用本机可用的 CUDA 或 MPS，否则使用 CPU。
 
@@ -67,6 +78,8 @@ python -B -m src.grade --predictions "$PILOT/eval/predictions.jsonl" \
 ```
 
 训练只更新 `q_proj` 和 `v_proj` 上的 LoRA 参数，并使用与生成一致的题目模板。题目和补齐部分不计入损失；超过 `--max-length` 的完整解答会跳过，数量写入训练的 `run.json`。`sft/steps.jsonl` 记录每步损失和梯度，`sft/adapter/` 保存小型 adapter。重载后用同一批开发题、同一判分规则和 1024 个新 Token 预算，便于和 Base 试跑对照。确认流程正常后，再用同一份训练数据和设置，把 `--loss-type` 改为 `dft` 并使用新的输出目录。
+
+C 组使用 `--loss-type idft`。先做同样的 8 条试跑，再扩大训练。见 [IDFT 损失与实现参数](docs/idft.md)。
 
 ## 接入真实实验
 

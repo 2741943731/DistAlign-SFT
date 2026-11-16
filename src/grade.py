@@ -1,4 +1,4 @@
-"""Grade saved math completions with a strict, numeric pilot scorer."""
+"""Grade saved math completions using their last complete answer box."""
 
 import argparse
 from collections import Counter
@@ -14,6 +14,7 @@ BOXED = re.compile(r"\\boxed\b")
 DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
 SLASH = re.compile(r"([+-]?[0-9]+)\s*/\s*([+-]?[0-9]+)")
 LATEX = re.compile(r"([+-]?)\s*\\frac\s*\{\s*([+-]?[0-9]+)\s*\}\s*\{\s*([+-]?[0-9]+)\s*\}")
+SCORERS = ("numeric", "symbolic")
 
 
 def extract_final_answer(completion: str) -> str | None:
@@ -53,21 +54,41 @@ def parse_number(answer: str) -> Fraction | None:
     return None
 
 
-def grade(completion: str, answer: str) -> dict:
+def _load_symbolic():
+    try:
+        from .symbolic import equivalent
+    except ModuleNotFoundError as exc:
+        if exc.name in {"lark", "sympy"}:
+            raise ValueError("symbolic scoring requires the symbolic-eval extra") from exc
+        raise
+    return equivalent
+
+
+def grade(completion: str, answer: str, *, scorer: str = "numeric") -> dict:
+    if scorer not in SCORERS:
+        raise ValueError(f"unknown scorer: {scorer}")
     prediction = extract_final_answer(completion)
     if prediction is None:
         status = "unparsed"
     else:
         predicted = parse_number(prediction)
         expected = parse_number(answer)
-        if predicted is None or expected is None:
-            status = "unsupported"
+        if predicted is not None and expected is not None:
+            matches = predicted == expected
+        elif scorer == "symbolic":
+            matches = _load_symbolic()(
+                prediction if predicted is None else predicted,
+                answer if expected is None else expected,
+            )
         else:
-            status = "correct" if predicted == expected else "incorrect"
+            matches = None
+        status = "unsupported" if matches is None else "correct" if matches else "incorrect"
     return {"prediction": prediction, "status": status, "correct": status == "correct"}
 
 
-def grade_file(predictions: Path, output: Path) -> dict:
+def grade_file(predictions: Path, output: Path, *, scorer: str = "numeric") -> dict:
+    if scorer == "symbolic":
+        _load_symbolic()
     results = []
     seen_ids = set()
     for row, where in Jsonl(predictions):
@@ -79,7 +100,10 @@ def grade_file(predictions: Path, output: Path) -> dict:
         if identifier in seen_ids:
             raise ValueError(f"{where}: duplicate id {identifier!r}")
         seen_ids.add(identifier)
-        results.append({"id": identifier, "completion": completion, "answer": answer, **grade(completion, answer)})
+        results.append({
+            "id": identifier, "completion": completion, "answer": answer,
+            **grade(completion, answer, scorer=scorer),
+        })
     if not results:
         raise ValueError("at least one prediction is required")
 
@@ -87,16 +111,20 @@ def grade_file(predictions: Path, output: Path) -> dict:
         for result in results:
             stream.write(json.dumps(result, ensure_ascii=False) + "\n")
     counts = Counter(result["status"] for result in results)
-    return {"total": len(results), "accuracy": counts["correct"] / len(results), "counts": dict(counts)}
+    summary = {"total": len(results), "accuracy": counts["correct"] / len(results), "counts": dict(counts)}
+    if scorer == "symbolic":
+        summary["scorer"] = "symbolic-v1"
+    return summary
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--predictions", type=Path, required=True, help="JSONL with id, completion, and answer")
     parser.add_argument("--output", type=Path, required=True, help="New JSONL file for per-question results")
+    parser.add_argument("--scorer", choices=SCORERS, default="numeric")
     args = parser.parse_args()
     try:
-        summary = grade_file(args.predictions, args.output)
+        summary = grade_file(args.predictions, args.output, scorer=args.scorer)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     print(json.dumps(summary))

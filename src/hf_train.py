@@ -10,7 +10,7 @@ import torch
 
 from data.validate import Jsonl, text_field
 from .generate import PROMPT
-from .losses import causal_lm_loss
+from .losses import IDFT_CONFIG, LOSS_TYPES, causal_lm_loss
 
 
 IGNORE_INDEX = -100
@@ -62,7 +62,7 @@ def main() -> None:
     parser.add_argument("--model", type=Path, required=True, help="Local Qwen model and tokenizer directory")
     parser.add_argument("--train-data", type=Path, required=True, help="JSONL with problem and solution")
     parser.add_argument("--output-dir", type=Path, required=True, help="New directory for adapter and logs")
-    parser.add_argument("--loss-type", choices=("sft", "dft"), default="sft")
+    parser.add_argument("--loss-type", choices=LOSS_TYPES, default="sft")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--limit", type=int, help="Select the first N examples that fit")
     parser.add_argument("--epochs", type=int, default=1)
@@ -174,6 +174,8 @@ def main() -> None:
         "steps": step, "supervised_tokens": supervised_tokens, "training_time_seconds": elapsed,
         "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
     }
+    if args.loss_type == "idft":
+        run["idft"] = {**IDFT_CONFIG, "warmup_ratio": 0.0, "transition_ratio": 0.0}
     (args.output_dir / "run.json").write_text(json.dumps(run, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Saved LoRA adapter after {step} steps to {adapter_dir}")
 

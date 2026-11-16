@@ -1,0 +1,13 @@
+{"id":"radical","completion":"Therefore \\boxed{\\sqrt{8}}.","answer":"2\\sqrt{2}"}
+{"id":"pi","completion":"Therefore \\boxed{2\\pi^{2}}.","answer":"\\frac{4\\pi^{2}}{2}"}
+{"id":"scalar","completion":"Therefore \\boxed{\\sqrt{16}}.","answer":"4"}
+{"id":"percent","completion":"Therefore \\boxed{40.5\\%}.","answer":"0.405"}
+{"id":"percent-needs-conversion","completion":"Therefore \\boxed{40.5\\%}.","answer":"40.5"}
+{"id":"different-radical","completion":"Therefore \\boxed{\\sqrt{3}}.","answer":"2\\sqrt{2}"}
+{"id":"different-exact-value","completion":"Therefore \\boxed{0.500000000001\\pi}.","answer":"\\frac{\\pi}{2}"}
+{"id":"malformed","completion":"Therefore \\boxed{\\sqrt{8}-}.","answer":"2\\sqrt{2}"}
+{"id":"equation","completion":"Therefore \\boxed{99=1}.","answer":"1"}
+{"id":"undefined","completion":"Therefore \\boxed{\\frac{\\pi}{0}}.","answer":"\\pi"}
+{"id":"ambiguous","completion":"Therefore \\boxed{1\\frac{1}{2}}.","answer":"\\frac{1}{2}"}
+{"id":"unboxed","completion":"Therefore the answer is -19.","answer":"-19"}
+{"id":"truncated","completion":"Try \\boxed{4}. Finally \\boxed{\\sqrt{","answer":"4"}

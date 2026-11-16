@@ -1,4 +1,4 @@
-"""Run a tiny CPU train step through the shared SFT/DFT objective."""
+"""Run a tiny CPU training loop through the shared next-token objectives."""
 
 import argparse
 import json
@@ -31,15 +31,15 @@ def main():
     import torch
     from torch import nn
 
-    from .losses import causal_lm_loss
+    from .losses import LOSS_TYPES, causal_lm_loss
 
     config = tomllib.loads(args.config.read_text(encoding="utf-8"))
     loss_type = config["loss_type"]
     steps, batch_size, max_length = (config[key] for key in ("steps", "batch_size", "max_length"))
     if min(steps, batch_size, max_length) < 1:
         parser.error("steps, batch_size and max_length must be positive")
-    if loss_type not in {"sft", "dft"}:
-        parser.error("loss_type must be sft or dft")
+    if loss_type not in LOSS_TYPES:
+        parser.error(f"loss_type must be one of {LOSS_TYPES}")
 
     examples = []
     over_length = 0

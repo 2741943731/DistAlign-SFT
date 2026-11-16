@@ -1,3 +1,4 @@
+from importlib.util import find_spec
 import json
 from pathlib import Path
 import tempfile
@@ -29,3 +30,20 @@ class GradeTests(unittest.TestCase):
         self.assertEqual(summary["accuracy"], 0.4)
         self.assertEqual(summary["counts"], {"correct": 2, "incorrect": 1, "unparsed": 1, "unsupported": 1})
         self.assertEqual(results[2]["prediction"], "4")
+
+    @unittest.skipUnless(find_spec("lark") and find_spec("sympy"), "symbolic-eval is not installed")
+    def test_symbolic_grades_entire_box_without_relaxing_extraction(self):
+        fixture = Path(__file__).resolve().parents[1] / "examples" / "grading-symbolic.jsonl"
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "graded.jsonl"
+            summary = grade_file(fixture, output, scorer="symbolic")
+            results = {r["id"]: r["status"] for r in map(json.loads, output.read_text().splitlines())}
+        self.assertEqual(results, {
+            "radical": "correct", "pi": "correct", "scalar": "correct",
+            "percent": "correct", "percent-needs-conversion": "incorrect",
+            "different-radical": "incorrect", "different-exact-value": "incorrect",
+            "malformed": "unsupported", "equation": "unsupported", "undefined": "unsupported",
+            "ambiguous": "unsupported", "unboxed": "unparsed", "truncated": "unparsed",
+        })
+        self.assertEqual(summary["accuracy"], 4 / 13)
+        self.assertEqual(summary["scorer"], "symbolic-v1")
