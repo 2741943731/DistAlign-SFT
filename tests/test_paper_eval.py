@@ -1,17 +1,93 @@
 import json
+import argparse
+import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.generate import NEXT_QUESTION, read_questions
 from src.grade import grade
 from src.paper_eval import (
     MODEL_HASH, PAPER, PROMPT, PROTOCOL, SAMPLING, SEED,
-    _limits, check_smoke, sample_rounds, score_rounds,
+    _adapter_metadata, _generate, _limits, check_smoke, sample_rounds, score_rounds,
 )
 
 
 class PaperEvalTests(unittest.TestCase):
+    def test_vllm_adapter_generation_and_resume_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "model"
+            model.mkdir()
+            adapter = root / "adapter"
+            adapter.mkdir()
+            config = {"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": 8, "lora_alpha": 16,
+                      "bias": "none", "target_modules": ["q_proj", "v_proj"]}
+            (adapter / "adapter_config.json").write_text(json.dumps(config))
+            weights = adapter / "adapter_model.safetensors"
+            weights.write_bytes(b"fixture-adapter")
+            calls = []
+
+            class FakeRequest:
+                def __init__(self, name, number, path):
+                    self.name, self.number, self.path = name, number, path
+
+            class FakeLLM:
+                def __init__(self, **kwargs):
+                    calls.append(("init", kwargs))
+                def get_tokenizer(self):
+                    return types.SimpleNamespace(encode=lambda *a, **kw: [1, 2])
+                def generate(self, inputs, params, **kwargs):
+                    calls.append(("generate", kwargs))
+                    candidate = types.SimpleNamespace(text=r"\boxed{3}", token_ids=[1],
+                                                      finish_reason="stop", stop_reason=None)
+                    return [types.SimpleNamespace(outputs=[candidate]) for _ in inputs]
+
+            modules = {
+                "vllm": types.SimpleNamespace(LLM=FakeLLM, SamplingParams=lambda **kwargs: kwargs),
+                "vllm.lora": types.ModuleType("vllm.lora"),
+                "vllm.lora.request": types.SimpleNamespace(LoRARequest=FakeRequest),
+            }
+            questions = [{"id": "a", "problem": "1+2?", "answer": "3"}]
+            meta = {"rows": 1, "sha256": "fixture"}
+            args = argparse.Namespace(model=model, adapter=adapter, suite="smoke", output_dir=root / "eval")
+            with patch.dict(sys.modules, modules), patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-test"}), \
+                    patch("src.paper_eval._model_sha", return_value=MODEL_HASH), \
+                    patch("src.paper_eval.version", return_value="fixture"):
+                _generate(args, questions, meta, 2)
+                manifest = json.loads((args.output_dir / "run.json").read_text())
+                self.assertEqual(manifest["adapter"], _adapter_metadata(adapter))
+                self.assertTrue(calls[0][1]["enable_lora"])
+                self.assertEqual(calls[0][1]["max_lora_rank"], 8)
+                for _, kwargs in calls[1:]:
+                    self.assertEqual(kwargs["lora_request"].path, str(adapter.resolve()))
+                self.assertEqual(check_smoke(args.output_dir, questions, meta, grade)["smoke"], "passed")
+                count = len(calls)
+                _generate(args, questions, meta, 2)
+                self.assertEqual(len(calls), count)
+                weights.write_bytes(b"different-adapter")
+                with self.assertRaisesRegex(ValueError, "run.json differs"):
+                    _generate(args, questions, meta, 2)
+
+                args.adapter = None
+                args.output_dir = root / "base-eval"
+                calls.clear()
+                _generate(args, questions, meta, 2)
+                self.assertNotIn("enable_lora", calls[0][1])
+                self.assertNotIn("adapter", json.loads((args.output_dir / "run.json").read_text()))
+                for _, kwargs in calls[1:]:
+                    self.assertNotIn("lora_request", kwargs)
+
+    def test_adapter_config_validation_rejects_wrong_rank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = Path(tmp)
+            (adapter / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 16}))
+            with self.assertRaisesRegex(ValueError, "not the expected"):
+                _adapter_metadata(adapter)
+
     def _write_smoke(self, directory, answers):
         questions = [
             {"id": "a", "problem": "One plus two?", "answer": "3"},

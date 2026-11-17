@@ -7,6 +7,7 @@ from importlib.metadata import version
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 
 from data.validate import Jsonl
@@ -95,6 +96,15 @@ def _validate_manifest(directory, suite, meta, rounds):
     source = run.get("questions")
     if not isinstance(source, dict) or any(source.get(key) != meta[key] for key in ("sha256", "rows")):
         raise ValueError("evaluation questions do not match the generation manifest")
+    if "adapter" in run:
+        adapter = run["adapter"]
+        if (not isinstance(adapter, dict) or not isinstance(adapter.get("path"), str)
+                or not isinstance(adapter.get("weights_sha256"), str)
+                or not isinstance(adapter.get("config_sha256"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", adapter.get("weights_sha256", ""))
+                or not re.fullmatch(r"[a-f0-9]{64}", adapter.get("config_sha256", ""))
+                or adapter.get("rank") != 8 or adapter.get("alpha") != 16):
+            raise ValueError("evaluation adapter identity is malformed")
 
 
 def check_smoke(directory, questions, meta, compare):
@@ -171,12 +181,31 @@ def _model_config_sha(model):
     }
 
 
+def _adapter_metadata(path):
+    """Freeze adapter bytes and validate the LoRA shape used by this experiment."""
+    path = path.resolve()
+    config_bytes = (path / "adapter_config.json").read_bytes()
+    config = json.loads(config_bytes)
+    if (not isinstance(config, dict) or config.get("peft_type") != "LORA"
+            or config.get("task_type") != "CAUSAL_LM" or config.get("r") != 8
+            or config.get("lora_alpha") != 16 or config.get("bias") != "none"
+            or set(config.get("target_modules") or []) != {"q_proj", "v_proj"}
+            or config.get("use_dora", False) or config.get("modules_to_save")):
+        raise ValueError("adapter configuration is not the expected rank-8 Qwen LoRA")
+    with (path / "adapter_model.safetensors").open("rb") as weights:
+        digest = hashlib.file_digest(weights, "sha256").hexdigest()
+    return {"path": str(path), "weights_sha256": digest,
+            "config_sha256": hashlib.sha256(config_bytes).hexdigest(), "rank": 8, "alpha": 16}
+
+
 def _generate(args, questions, meta, rounds):
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if not gpu or "," in gpu:
         raise ValueError("set CUDA_VISIBLE_DEVICES to a single GPU")
     model = args.model.resolve()
     weights = _model_sha(model)
+    adapter_path = getattr(args, "adapter", None)
+    adapter = _adapter_metadata(adapter_path) if adapter_path is not None else None
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     try:
@@ -193,6 +222,8 @@ def _generate(args, questions, meta, rounds):
         **_limits(args.suite),
         "dtype": "bfloat16", "generation_config": "vllm", "gpu_memory_utilization": 0.8,
     }
+    if adapter is not None:
+        manifest["adapter"] = adapter
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run = args.output_dir / "run.json"
     if run.exists():
@@ -207,10 +238,16 @@ def _generate(args, questions, meta, rounds):
         for index in range(rounds):
             _read_round(args.output_dir, questions, index)
         return
+    lora_kwargs = {"enable_lora": True, "max_lora_rank": 8} if adapter else {}
     engine = LLM(
         model=str(model), dtype="bfloat16", max_model_len=CONTEXT,
         tensor_parallel_size=1, generation_config="vllm", gpu_memory_utilization=0.8,
+        **lora_kwargs,
     )
+    request = None
+    if adapter:
+        from vllm.lora.request import LoRARequest
+        request = LoRARequest("distalign-adapter", 1, adapter["path"])
     tokenizer = engine.get_tokenizer()
 
     def sample(prompts, seeds):
@@ -223,7 +260,7 @@ def _generate(args, questions, meta, rounds):
         if min(caps) < 1:
             raise ValueError("a prompt fills the model context; no silent truncation")
         params = [SamplingParams(**SAMPLING, max_tokens=cap, seed=seed) for cap, seed in zip(caps, seeds)]
-        outputs = engine.generate(inputs, params)
+        outputs = engine.generate(inputs, params, lora_request=request) if request else engine.generate(inputs, params)
         for output, cap in zip(outputs, caps, strict=True):
             if len(output.outputs) != 1:
                 raise ValueError("expected one vLLM sample per prompt")
@@ -244,8 +281,11 @@ def main():
     parser.add_argument("--questions", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", type=Path)
+    parser.add_argument("--adapter", type=Path, help="Local LoRA adapter for generation")
     args = parser.parse_args()
     try:
+        if args.adapter is not None and args.action != "generate":
+            raise ValueError("--adapter is only used for generation; scoring reads the manifest")
         if args.action == "check-smoke" and args.suite != "smoke":
             raise ValueError("check-smoke requires --suite smoke")
         questions, meta, rounds = _questions(args.questions, args.suite)

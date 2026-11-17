@@ -17,6 +17,7 @@ from .validate import Jsonl, teacher_fields, text_field
 NUMINA_REPO = "project-numina/NuminaMath-CoT"
 NUMINA_REVISION = "9d8d210c9f6a36c8f3cd84045668c9b7800ef517"
 NUMINA_SHARD = "data/train-00000-of-00005.parquet"
+NUMINA_SHARD_SHA256 = "25c0fa2ca96dd8078470ad1bbc439d0d211fd8b7d22e04abf7f61e9be9bf9ec3"
 NUMINA_COLUMNS = ("problem", "solution", "source")
 DATASETS_VERSION = "4.4.1"
 CANDIDATE_LIMIT = 16_384
@@ -38,7 +39,18 @@ def check_holdout(path: Path) -> None:
         raise ValueError(f"{path}: does not match the pinned 500-question holdout")
 
 
-def stream_teacher() -> Iterable[dict]:
+def check_local_shard(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != NUMINA_SHARD_SHA256:
+        raise ValueError(f"{path}: SHA-256 mismatch; expected {NUMINA_SHARD_SHA256}, got {actual}")
+    return actual
+
+
+def stream_teacher(local_shard: Path | None = None) -> Iterable[dict]:
     try:
         import datasets
     except ImportError as exc:
@@ -46,7 +58,8 @@ def stream_teacher() -> Iterable[dict]:
     if datasets.__version__ != DATASETS_VERSION:
         raise ValueError(f"expected datasets=={DATASETS_VERSION}; found {datasets.__version__}")
 
-    url = f"https://huggingface.co/datasets/{NUMINA_REPO}/resolve/{NUMINA_REVISION}/{NUMINA_SHARD}"
+    url = (str(local_shard.resolve()) if local_shard is not None else
+           f"https://huggingface.co/datasets/{NUMINA_REPO}/resolve/{NUMINA_REVISION}/{NUMINA_SHARD}")
     yield from datasets.load_dataset(
         "parquet", data_files={"train": url}, split="train", streaming=True, columns=list(NUMINA_COLUMNS),
     )
@@ -87,11 +100,13 @@ def main() -> None:
     parser.add_argument("--held-out", required=True, type=Path, help="Pinned, question-only MATH-500 JSONL")
     parser.add_argument("--output-dir", required=True, type=Path, help="Fresh directory for this data build")
     parser.add_argument("--candidate-limit", type=int, default=CANDIDATE_LIMIT, help="Maximum rows to read from the first shard")
+    parser.add_argument("--local-shard", type=Path, help="Offline copy of the pinned first Parquet shard; SHA-256 must match")
     args = parser.parse_args()
     try:
         check_holdout(args.held_out)
+        local_shard_sha = check_local_shard(args.local_shard) if args.local_shard is not None else None
         audit = build_split(
-            stream_teacher(), args.held_out, args.output_dir,
+            stream_teacher(args.local_shard), args.held_out, args.output_dir,
             candidate_limit=args.candidate_limit, train_rows=TRAIN_ROWS, dev_rows=DEV_ROWS,
         )
     except (OSError, ValueError) as exc:
@@ -101,7 +116,9 @@ def main() -> None:
         "protocol": "numina-sft-single-gpu-pilot-v1",
         "source": {"repo": NUMINA_REPO, "revision": NUMINA_REVISION, "shard": NUMINA_SHARD,
                    "columns": NUMINA_COLUMNS, "datasets_version": DATASETS_VERSION,
-                   "candidate_limit": args.candidate_limit, "raw_rows": audit["input"]["rows"]},
+                   "candidate_limit": args.candidate_limit, "raw_rows": audit["input"]["rows"],
+                   "local_shard": str(args.local_shard.resolve()) if args.local_shard else None,
+                   "local_shard_sha256": local_shard_sha},
         "held_out": {"repo": "HuggingFaceH4/MATH-500", "revision": MATH500_REVISION,
                      "problems_sha256": MATH500_PROBLEMS_SHA256, "role": "exact problem exclusion only"},
         "selection_seed": SEED,
